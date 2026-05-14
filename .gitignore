@@ -1,0 +1,12 @@
+# runtime-generated, per CLAUDE.md layout
+compiled/
+logs/
+profiles/
+state/
+
+# workshop catalog + cached Next.js buildId
+workshop/catalog.json
+workshop/.cache.json
+
+# node
+node_modules/
