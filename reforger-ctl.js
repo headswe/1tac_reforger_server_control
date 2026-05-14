@@ -8,7 +8,7 @@
 //   logs/              — per-run server logs
 //   state/server.json  — running server tracking
 
-import { select, confirm, input, checkbox } from '@inquirer/prompts';
+import { select, confirm, input, checkbox, editor } from '@inquirer/prompts';
 import { readdir, readFile, writeFile, unlink, mkdir } from 'node:fs/promises';
 import { existsSync, openSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -634,6 +634,105 @@ async function workshopUpdates() {
   }
 }
 
+async function subscribeBatch(label, mods) {
+  const cat  = await catalog.load();
+  const spin = new Spinner().start(`${label} — 0/${mods.length}…`);
+  const errors = await catalog.subscribeMany(cat, mods, (done, total, m) => {
+    spin.update(`${label} — ${done}/${total} — ${m.name ?? m.modId}…`);
+  });
+  await catalog.save(cat);
+  if (errors.length) {
+    spin.warn(`${label}: ${mods.length - errors.length}/${mods.length} ok, ${errors.length} failed`);
+    for (const e of errors) {
+      console.log(`  ${c.red('✗')} ${e.name ?? e.modId}  ${c.dim(e.error)}`);
+    }
+  } else {
+    spin.succeed(`${label}: ${mods.length} mod(s) subscribed`);
+  }
+}
+
+async function importServerConfig(data) {
+  let name = data.game.name;
+  if (!name) {
+    name = (await input({ message: 'Server name (config has none):' })).trim();
+    if (!name) { console.log(c.red('  a name is required')); await sleep(1200); return; }
+  }
+  const file = `${slugify(name)}.json`;
+  const path = join(SERVERS_DIR, file);
+  if (existsSync(path) &&
+      !await confirm({ message: `servers/${file} exists — overwrite?`, default: false })) {
+    return;
+  }
+  await writeFile(path, JSON.stringify(data, null, 2));
+  console.log(c.dim(`  saved servers/${file}`));
+
+  const mods = Array.isArray(data.game.mods) ? data.game.mods.filter(m => m?.modId) : [];
+  if (mods.length) await subscribeBatch('Cataloging mods', mods);
+  await sleep(1200);
+}
+
+// Import JSON pasted from the in-game workshop or an existing server config.
+// Auto-detects: array of mod entries, a single mod entry, a full server config
+// (has a `game` block), or an already-made preset (`scenario` string).
+async function workshopImport() {
+  const source = await select({
+    message: 'Import JSON from:',
+    choices: [
+      { name: 'Paste into editor',   value: 'editor' },
+      { name: 'Read from file path', value: 'file'   },
+      { name: c.dim('— back —'),     value: 'back'   },
+    ],
+  });
+  if (source === 'back') return;
+
+  let raw;
+  if (source === 'editor') {
+    raw = await editor({ message: 'Paste JSON, then save & close the editor:', postfix: '.json' });
+  } else {
+    const p = (await input({ message: 'Path to JSON file:' })).trim();
+    if (!p) return;
+    try { raw = await readFile(p, 'utf8'); }
+    catch (e) { console.log(c.red(`  cannot read file: ${e.message}`)); await sleep(1300); return; }
+  }
+
+  let data;
+  try { data = JSON.parse(raw); }
+  catch (e) { console.log(c.red(`  invalid JSON: ${e.message}`)); await sleep(1600); return; }
+
+  // array of mod entries, or a single mod entry
+  let modList = null;
+  if (Array.isArray(data) && data.length && data.every(d => d && typeof d.modId === 'string')) {
+    modList = data;
+  } else if (data && typeof data.modId === 'string') {
+    modList = [data];
+  }
+  if (modList) {
+    await subscribeBatch('Subscribing', modList);
+    await sleep(1200);
+    return;
+  }
+
+  // full server config
+  if (data && typeof data.game === 'object' && data.game) {
+    await importServerConfig(data);
+    return;
+  }
+
+  // already a preset
+  if (data && typeof data.scenario === 'string') {
+    const name = data.name || 'imported-preset';
+    const file = `${slugify(name)}.json`;
+    await writeFile(join(SERVERS_DIR, file), JSON.stringify(data, null, 2));
+    console.log(c.dim(`  saved preset servers/${file}`));
+    await sleep(1000);
+    return;
+  }
+
+  console.log(c.red('  unrecognized JSON — expected a mod entry, an array of mod ' +
+    'entries, a server config, or a preset'));
+  await sleep(2000);
+}
+
 async function workshopMenu() {
   while (true) {
     let count = 0;
@@ -646,6 +745,7 @@ async function workshopMenu() {
       message: `Workshop  ${c.dim('· ' + count + ' mods in catalog')}`,
       choices: [
         { name: 'Search & subscribe', value: 'search'  },
+        { name: 'Import (paste JSON)', value: 'import' },
         { name: 'View catalog',       value: 'catalog' },
         { name: 'Check for updates',  value: 'updates' },
         { name: c.dim('— back —'),    value: 'back'    },
@@ -653,6 +753,7 @@ async function workshopMenu() {
     });
     if (choice === 'back')    return;
     if (choice === 'search')  await workshopSearch();
+    if (choice === 'import')  await workshopImport();
     if (choice === 'catalog') await workshopCatalog();
     if (choice === 'updates') await workshopUpdates();
   }
