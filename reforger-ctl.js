@@ -8,13 +8,15 @@
 //   logs/              — per-run server logs
 //   state/server.json  — running server tracking
 
-import { select, confirm } from '@inquirer/prompts';
+import { select, confirm, input } from '@inquirer/prompts';
 import { readdir, readFile, writeFile, unlink, mkdir } from 'node:fs/promises';
 import { existsSync, openSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
+import * as api from './workshop/api.js';
+import * as catalog from './workshop/catalog.js';
 
 // ── paths ─────────────────────────────────────────────────────────────────
 const SCRIPT_DIR   = dirname(fileURLToPath(import.meta.url));
@@ -154,6 +156,11 @@ function formatDuration(ms) {
   if (h < 24) return `${h}h${m % 60}m`;
   const d = Math.floor(h / 24);
   return `${d}d${h % 24}h`;
+}
+function formatSize(bytes) {
+  if (bytes == null) return '—';
+  const mb = bytes / 1048576;
+  return mb < 1024 ? `${mb.toFixed(0)} MB` : `${(mb / 1024).toFixed(1)} GB`;
 }
 
 // ── load base + modpacks + servers ────────────────────────────────────────
@@ -434,6 +441,181 @@ async function tailLog(logFile) {
   });
 }
 
+// ── workshop ──────────────────────────────────────────────────────────────
+function catalogLine(id, entry) {
+  const scn  = entry.scenarios?.length ?? 0;
+  const dep  = entry.dependencies?.length ?? 0;
+  const meta = `${entry.version ?? '?'} · ${scn} scn · ${dep} dep`;
+  const flag = entry.obsolete ? '  ' + c.red('obsolete') : '';
+  return `${c.bold(entry.name)}  ${c.dim('· ' + meta)}${flag}  ${c.dim(id)}`;
+}
+
+async function workshopSearch() {
+  const query = (await input({ message: 'Search workshop (name):' })).trim();
+  if (!query) return;
+
+  let page = 1;
+  let pageSize = 0;
+  while (true) {
+    const spin = new Spinner().start(`Searching “${query}” — page ${page}…`);
+    let res;
+    try { res = await api.search(query, page); }
+    catch (e) { spin.fail(`Search failed: ${e.message}`); await sleep(900); return; }
+
+    if (page === 1) pageSize = res.rows.length || 1;
+    spin.succeed(`${res.count} result${res.count === 1 ? '' : 's'} for “${query}” — page ${page}`);
+
+    if (res.rows.length === 0) { console.log(c.dim('  no results')); await sleep(800); return; }
+
+    const choices = res.rows.map(r => ({
+      name: `${c.bold(r.name)}  ${c.dim('· ' + (r.currentVersionNumber ?? '?') +
+        ' · ' + (r.subscriberCount ?? 0) + ' subs')}  ${c.dim(r.id)}`,
+      value: { kind: 'mod', id: r.id, name: r.name },
+    }));
+    if (page > 1)                          choices.push({ name: c.dim('‹ previous page'), value: { kind: 'prev' } });
+    if (page * pageSize < res.count)        choices.push({ name: c.dim('next page ›'),    value: { kind: 'next' } });
+    choices.push({ name: c.dim('— back —'), value: { kind: 'back' } });
+
+    const pick = await select({ message: 'Subscribe to:', choices, pageSize: 20 });
+    if (pick.kind === 'back') return;
+    if (pick.kind === 'next') { page++; continue; }
+    if (pick.kind === 'prev') { page--; continue; }
+
+    const cat  = await catalog.load();
+    const spin2 = new Spinner().start(`Subscribing ${c.bold(pick.name)}…`);
+    try {
+      await catalog.subscribe(cat, pick.id, pick.name);
+      await catalog.save(cat);
+      const e = cat[pick.id];
+      spin2.succeed(`Subscribed ${c.bold(pick.name)} — ` +
+        `${e.scenarios.length} scenario(s), ${e.dependencies.length} dependency(ies)`);
+    } catch (e) {
+      spin2.fail(`Subscribe failed: ${e.message}`);
+    }
+    await sleep(900);
+    return;
+  }
+}
+
+async function workshopCatalog() {
+  let cat;
+  try { cat = await catalog.load(); }
+  catch (e) { console.log(c.red(`  ${e.message}`)); await sleep(1200); return; }
+
+  const ids = Object.keys(cat);
+  if (ids.length === 0) {
+    console.log(c.dim('\n  catalog is empty — subscribe to mods first\n'));
+    await sleep(900);
+    return;
+  }
+
+  const choices = ids.map(id => ({ name: catalogLine(id, cat[id]), value: id }));
+  choices.push({ name: c.dim('— back —'), value: '__back__' });
+
+  const pick = await select({ message: `Catalog — ${ids.length} mods:`, choices, pageSize: 20 });
+  if (pick === '__back__') return;
+
+  const entry = cat[pick];
+  console.log();
+  console.log(`  ${c.bold(entry.name)}  ${c.dim(pick)}`);
+  console.log(`  ${c.dim('version:')} ${entry.version ?? '—'}   ` +
+    `${c.dim('game:')} ${entry.gameVersion ?? '—'}   ${c.dim('size:')} ${formatSize(entry.size)}` +
+    (entry.obsolete ? `   ${c.red('obsolete')}` : ''));
+  if (entry.dependencies?.length) {
+    console.log(`  ${c.dim('deps:')}    ${entry.dependencies.map(d => d.name).join(', ')}`);
+  }
+  if (entry.scenarios?.length) {
+    console.log(`  ${c.dim('scenarios:')}`);
+    for (const s of entry.scenarios) {
+      console.log(`    ${s.name}  ${c.dim('· ' + s.gameMode + ' · ' + (s.playerCount ?? '?') + 'p')}`);
+    }
+  }
+  console.log();
+
+  const action = await select({
+    message: 'Action:',
+    choices: [
+      { name: 'Unsubscribe (remove from catalog)', value: 'remove' },
+      { name: c.dim('— back —'),                   value: 'back'   },
+    ],
+  });
+  if (action === 'remove' &&
+      await confirm({ message: `Remove ${entry.name}?`, default: false })) {
+    delete cat[pick];
+    await catalog.save(cat);
+    console.log(c.dim(`  removed ${entry.name}`));
+    await sleep(600);
+  }
+}
+
+async function workshopUpdates() {
+  let cat;
+  try { cat = await catalog.load(); }
+  catch (e) { console.log(c.red(`  ${e.message}`)); await sleep(1200); return; }
+
+  const ids = Object.keys(cat);
+  if (ids.length === 0) {
+    console.log(c.dim('\n  catalog is empty\n'));
+    await sleep(900);
+    return;
+  }
+
+  const spin = new Spinner().start(`Checking ${ids.length} mods for updates…`);
+  let changes;
+  try { changes = await catalog.checkUpdates(cat); }
+  catch (e) { spin.fail(`Update check failed: ${e.message}`); await sleep(900); return; }
+
+  const errors  = changes.filter(ch => ch.error);
+  const updates = changes.filter(ch => !ch.error);
+
+  if (updates.length === 0 && errors.length === 0) {
+    spin.succeed('All mods up to date');
+    await sleep(900);
+    return;
+  }
+  spin.succeed(`${updates.length} update(s) available` +
+    (errors.length ? `, ${errors.length} check error(s)` : ''));
+
+  console.log();
+  for (const u of updates) {
+    const flag = u.obsolete ? '  ' + c.red('OBSOLETE') : '';
+    console.log(`  ${c.yellow('↑')} ${c.bold(u.name)}  ${u.from ?? '?'} ${c.dim('→')} ${c.green(u.to ?? '?')}${flag}`);
+  }
+  for (const e of errors) {
+    console.log(`  ${c.red('✗')} ${c.bold(e.name)}  ${c.dim(e.error)}`);
+  }
+  console.log();
+
+  if (updates.length &&
+      await confirm({ message: `Apply ${updates.length} update(s) to catalog?`, default: true })) {
+    for (const u of updates) cat[u.modId] = u.entry;
+    await catalog.save(cat);
+    console.log(c.dim('  catalog updated'));
+    await sleep(600);
+  }
+}
+
+async function workshopMenu() {
+  while (true) {
+    let count = 0;
+    try { count = Object.keys(await catalog.load()).length; } catch {}
+    console.log();
+    const choice = await select({
+      message: `Workshop  ${c.dim('· ' + count + ' mods in catalog')}`,
+      choices: [
+        { name: 'Search & subscribe', value: 'search'  },
+        { name: 'View catalog',       value: 'catalog' },
+        { name: 'Check for updates',  value: 'updates' },
+        { name: c.dim('— back —'),    value: 'back'    },
+      ],
+    });
+    if (choice === 'back')    return;
+    if (choice === 'search')  await workshopSearch();
+    if (choice === 'catalog') await workshopCatalog();
+    if (choice === 'updates') await workshopUpdates();
+  }
+}
+
 async function idleMenu(base, servers) {
   // base summary line for context
   const bport = base.bindPort ?? '?';
@@ -450,6 +632,10 @@ async function idleMenu(base, servers) {
     value: cfg,
     disabled: cfg.error ? c.red(' ' + cfg.error) : false,
   }));
+  choices.push({
+    name:  `${c.cyan('⚙  Workshop')}  ${c.dim('(search · catalog · updates)')}`,
+    value: '__workshop__',
+  });
   choices.push({ name: c.dim('— quit —'), value: '__quit__' });
 
   const pick = await select({
@@ -458,7 +644,8 @@ async function idleMenu(base, servers) {
     pageSize: 20,
   });
 
-  if (pick === '__quit__') return 'exit';
+  if (pick === '__quit__')     return 'exit';
+  if (pick === '__workshop__') { await workshopMenu(); return; }
 
   console.log();
   await startServer(pick);
