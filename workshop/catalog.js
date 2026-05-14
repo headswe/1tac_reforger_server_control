@@ -58,13 +58,44 @@ export function toEntry(asset) {
 }
 
 // Subscribe a mod and (recursively) its dependencies. Mutates + returns catalog.
-export async function subscribe(catalog, id, name, { _seen = new Set() } = {}) {
+// Top-level calls are flagged `subscribed: true`; dependencies pulled in behind
+// the scenes are `subscribed: false` so the UI can hide them. A mod that is both
+// directly subscribed and a dependency stays `subscribed: true`.
+export async function subscribe(catalog, id, name, opts = {}) {
+  const { _seen = new Set(), _dep = false } = opts;
   if (_seen.has(id)) return catalog;
   _seen.add(id);
+  const keepSubscribed = !_dep || catalog[id]?.subscribed === true;
   const asset = await fetchDetail(id, name);
   catalog[id] = toEntry(asset);
+  catalog[id].subscribed = keepSubscribed;
   for (const dep of catalog[id].dependencies) {
-    await subscribe(catalog, dep.modId, dep.name, { _seen });
+    await subscribe(catalog, dep.modId, dep.name, { _seen, _dep: true });
+  }
+  return catalog;
+}
+
+// Legacy catalogs (and freshly transformed entries) may lack the flag — treat
+// missing as subscribed so nothing silently disappears.
+export function isSubscribed(entry) {
+  return entry?.subscribed !== false;
+}
+
+// Drop dependency-only entries no longer reachable from any subscribed mod.
+export function pruneOrphans(catalog) {
+  const needed = new Set();
+  const walk = (id) => {
+    for (const dep of catalog[id]?.dependencies ?? []) {
+      if (!needed.has(dep.modId)) { needed.add(dep.modId); walk(dep.modId); }
+    }
+  };
+  for (const [id, entry] of Object.entries(catalog)) {
+    if (!isSubscribed(entry)) continue;
+    needed.add(id);
+    walk(id);
+  }
+  for (const id of Object.keys(catalog)) {
+    if (!needed.has(id)) delete catalog[id];
   }
   return catalog;
 }
@@ -82,6 +113,7 @@ export async function checkUpdates(catalog) {
       continue;
     }
     const fresh = toEntry(asset);
+    fresh.subscribed = isSubscribed(entry); // toEntry doesn't carry the flag
     if (fresh.versionId !== entry.versionId || fresh.obsolete !== entry.obsolete) {
       changes.push({
         modId:       id,

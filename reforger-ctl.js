@@ -505,7 +505,8 @@ async function workshopCatalog() {
   try { cat = await catalog.load(); }
   catch (e) { console.log(c.red(`  ${e.message}`)); await sleep(1200); return; }
 
-  const ids = Object.keys(cat);
+  const ids    = Object.keys(cat).filter(id => catalog.isSubscribed(cat[id]));
+  const depIds = Object.keys(cat).length - ids.length;
   if (ids.length === 0) {
     console.log(c.dim('\n  catalog is empty — subscribe to mods first\n'));
     await sleep(900);
@@ -515,7 +516,12 @@ async function workshopCatalog() {
   const choices = ids.map(id => ({ name: catalogLine(id, cat[id]), value: id }));
   choices.push({ name: c.dim('— back —'), value: '__back__' });
 
-  const pick = await select({ message: `Catalog — ${ids.length} mods:`, choices, pageSize: 20 });
+  const depNote = depIds ? c.dim(`  (+${depIds} dependency mods hidden)`) : '';
+  const pick = await select({
+    message: `Catalog — ${ids.length} mods:${depNote}`,
+    choices,
+    pageSize: 20,
+  });
   if (pick === '__back__') return;
 
   const entry = cat[pick];
@@ -545,6 +551,7 @@ async function workshopCatalog() {
   if (action === 'remove' &&
       await confirm({ message: `Remove ${entry.name}?`, default: false })) {
     delete cat[pick];
+    catalog.pruneOrphans(cat);
     await catalog.save(cat);
     console.log(c.dim(`  removed ${entry.name}`));
     await sleep(600);
@@ -601,7 +608,10 @@ async function workshopUpdates() {
 async function workshopMenu() {
   while (true) {
     let count = 0;
-    try { count = Object.keys(await catalog.load()).length; } catch {}
+    try {
+      const cat = await catalog.load();
+      count = Object.keys(cat).filter(id => catalog.isSubscribed(cat[id])).length;
+    } catch {}
     console.log();
     const choice = await select({
       message: `Workshop  ${c.dim('· ' + count + ' mods in catalog')}`,
@@ -627,7 +637,9 @@ async function composeAndStart(base) {
   try { cat = await catalog.load(); }
   catch (e) { console.log(c.red(`  ${e.message}`)); await sleep(1200); return; }
 
-  const scenarios = catalog.allScenarios(cat);
+  // only scenarios from explicitly-subscribed mods — dependency mods are noise
+  const scenarios = catalog.allScenarios(cat)
+    .filter(s => catalog.isSubscribed(cat[s.modId]));
   if (scenarios.length === 0) {
     console.log(c.dim('\n  no scenarios available — subscribe to mods in the Workshop menu first\n'));
     await sleep(1300);
@@ -648,7 +660,7 @@ async function composeAndStart(base) {
   const auto = new Set(catalog.resolveMods(cat, scenario.scenarioId).map(m => m.modId));
 
   const addonChoices = Object.keys(cat)
-    .filter(id => !auto.has(id))
+    .filter(id => !auto.has(id) && catalog.isSubscribed(cat[id]))
     .map(id => ({ name: catalogLine(id, cat[id]), value: id }));
 
   let addonIds = [];
