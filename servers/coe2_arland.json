@@ -1,0 +1,7 @@
+{
+  "game": {
+    "name": "1Tac · COE2 Arland",
+    "scenarioId": "{F239FD0036BD2C1E}Missions/COE2_Arland.conf",
+    "modpacks": ["coe2", "ace"]
+  }
+}

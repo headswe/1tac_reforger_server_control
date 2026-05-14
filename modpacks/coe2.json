@@ -1,0 +1,7 @@
+{
+  "description": "Combat Operations Everon 2 scenario + Kex framework",
+  "mods": [
+    { "modId": "60926835F4A7B0CA", "name": "COE2",              "version": "2.3.1"  },
+    { "modId": "5ED61DC0AFE17E8E", "name": "Kex Scenario Core", "version": "0.4.27" }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "description": "Escapists scenario + Scrt dependencies",
+  "mods": [
+    { "modId": "5F16D7E4A1CBE075", "name": "Escapists",         "version": "1.6.19" },
+    { "modId": "66AAB0873717CEF0", "name": "ScrtCore",          "version": "1.0.1"  },
+    { "modId": "66AD0B6D6E7A6A97", "name": "ScrtSharedContent", "version": "1.0.1"  }
+  ]
+}

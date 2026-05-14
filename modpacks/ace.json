@@ -1,0 +1,7 @@
+{
+  "description": "Advanced Combat Environment (dev builds)",
+  "mods": [
+    { "modId": "65AD7D0D9941A380", "name": "ACE Core Dev",     "version": "1.5.19" },
+    { "modId": "65AD7C249E4ECDFB", "name": "ACE Captives Dev", "version": "1.5.18" }
+  ]
+}

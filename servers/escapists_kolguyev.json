@@ -1,0 +1,7 @@
+{
+  "game": {
+    "name": "1Tac Escapists Kolguyev",
+    "scenarioId": "{45A046794EC4DE44}Missions/Escapists_Kolguyev.conf",
+    "modpacks": ["escapists"]
+  }
+}
