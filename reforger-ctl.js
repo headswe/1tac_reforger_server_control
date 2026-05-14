@@ -233,7 +233,29 @@ function expandModpacks(merged, packs) {
   return { merged: out, packCount: reqList.length, modCount: out.game.mods.length };
 }
 
-async function loadServers(base, packs) {
+// A servers/*.json file is either a "preset" ({ name, scenario, addons }) that
+// resolves against the workshop catalog, or a legacy config (game.scenarioId +
+// game.modpacks) merged the old way.
+function isPreset(data) {
+  return data != null && typeof data.scenario === 'string';
+}
+
+function resolvePreset(base, data, cat) {
+  if (!data.name) return { error: 'missing name' };
+  let mods;
+  try {
+    mods = catalog.resolveMods(cat, data.scenario, data.addons ?? []);
+  } catch (e) {
+    return { error: e.message };
+  }
+  const layer  = deepMerge({ game: { name: data.name, scenarioId: data.scenario, mods } },
+                           data.overrides ?? {});
+  const merged = deepMerge(base, layer);
+  const error  = validateMerged(merged);
+  return error ? { error } : { merged };
+}
+
+async function loadServers(base, packs, cat) {
   if (!existsSync(SERVERS_DIR)) return [];
   const files = await readdir(SERVERS_DIR);
   const out = [];
@@ -242,6 +264,13 @@ async function loadServers(base, packs) {
     const path = join(SERVERS_DIR, file);
     try {
       const data = JSON.parse(await readFile(path, 'utf8'));
+
+      if (isPreset(data)) {
+        const { merged, error } = resolvePreset(base, data, cat);
+        out.push({ file, path, data, merged: merged ?? null, packCount: 0, preset: true, error });
+        continue;
+      }
+
       const merged = deepMerge(base, data);
 
       let error = validateMerged(merged);
@@ -690,10 +719,20 @@ async function composeAndStart(base) {
   console.log(`  ${c.dim('mods:')}     ${mods.length}  ${c.dim('(incl. dependencies · ' +
     addonIds.length + ' addon' + (addonIds.length === 1 ? '' : 's') + ')')}`);
   console.log();
+
+  const file = `${slugify(name)}.json`;
+
+  if (await confirm({ message: 'Save as a reusable preset in servers/?', default: false })) {
+    const presetPath = join(SERVERS_DIR, file);
+    const preset = { name, scenario: scenario.scenarioId, addons: addonIds };
+    await writeFile(presetPath, JSON.stringify(preset, null, 2));
+    console.log(c.dim(`  saved ${presetPath}`));
+  }
+
   if (!await confirm({ message: `Start “${name}”?`, default: true })) return;
 
   console.log();
-  await startServer({ file: `${slugify(name)}.json`, merged });
+  await startServer({ file, merged });
   await sleep(700);
 }
 
@@ -753,7 +792,10 @@ async function main() {
 
     const packs   = await loadModpacks();
     const state   = await readState();
-    const servers = await loadServers(base, packs);
+    let cat = {};
+    try { cat = await catalog.load(); }
+    catch (e) { console.log(c.red(`workshop catalog: ${e.message}`)); }
+    const servers = await loadServers(base, packs, cat);
 
     if (state && state.pid !== prevPid) firstRunningView = true;
     prevPid = state?.pid ?? null;
