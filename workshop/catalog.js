@@ -81,6 +81,29 @@ export function isSubscribed(entry) {
   return entry?.subscribed !== false;
 }
 
+// Subscribe a batch of mods (e.g. an imported server config's mod list) in one
+// pass — dependencies shared across mods are fetched once. Every mod in `mods`
+// ends up flagged subscribed:true regardless of encounter order. Per-mod
+// failures are collected and returned rather than aborting the batch.
+// `onProgress(done, total, mod)` is called after each mod.
+export async function subscribeMany(catalog, mods, onProgress) {
+  const seen = new Set();
+  const errors = [];
+  let done = 0;
+  for (const m of mods) {
+    try {
+      await subscribe(catalog, m.modId, m.name, { _seen: seen, _dep: false });
+    } catch (e) {
+      errors.push({ modId: m.modId, name: m.name, error: e.message });
+    }
+    onProgress?.(++done, mods.length, m);
+  }
+  for (const m of mods) {
+    if (catalog[m.modId]) catalog[m.modId].subscribed = true;
+  }
+  return errors;
+}
+
 // Drop dependency-only entries no longer reachable from any subscribed mod.
 export function pruneOrphans(catalog) {
   const needed = new Set();
