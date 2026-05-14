@@ -1,0 +1,16 @@
+{
+  "name": "reforger-control-panel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "reforger-ctl": "./reforger-ctl.js"
+  },
+  "scripts": {
+    "start": "node reforger-ctl.js",
+    "smoke": "node workshop/smoke-test.mjs"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.0.0"
+  }
+}

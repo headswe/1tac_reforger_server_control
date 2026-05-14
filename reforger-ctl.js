@@ -8,13 +8,15 @@
 //   logs/              — per-run server logs
 //   state/server.json  — running server tracking
 
-import { select, confirm } from '@inquirer/prompts';
+import { select, confirm, input, checkbox } from '@inquirer/prompts';
 import { readdir, readFile, writeFile, unlink, mkdir } from 'node:fs/promises';
 import { existsSync, openSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
+import * as api from './workshop/api.js';
+import * as catalog from './workshop/catalog.js';
 
 // ── paths ─────────────────────────────────────────────────────────────────
 const SCRIPT_DIR   = dirname(fileURLToPath(import.meta.url));
@@ -155,6 +157,14 @@ function formatDuration(ms) {
   const d = Math.floor(h / 24);
   return `${d}d${h % 24}h`;
 }
+function formatSize(bytes) {
+  if (bytes == null) return '—';
+  const mb = bytes / 1048576;
+  return mb < 1024 ? `${mb.toFixed(0)} MB` : `${(mb / 1024).toFixed(1)} GB`;
+}
+function slugify(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'composed';
+}
 
 // ── load base + modpacks + servers ────────────────────────────────────────
 async function loadBase() {
@@ -223,7 +233,29 @@ function expandModpacks(merged, packs) {
   return { merged: out, packCount: reqList.length, modCount: out.game.mods.length };
 }
 
-async function loadServers(base, packs) {
+// A servers/*.json file is either a "preset" ({ name, scenario, addons }) that
+// resolves against the workshop catalog, or a legacy config (game.scenarioId +
+// game.modpacks) merged the old way.
+function isPreset(data) {
+  return data != null && typeof data.scenario === 'string';
+}
+
+function resolvePreset(base, data, cat) {
+  if (!data.name) return { error: 'missing name' };
+  let mods;
+  try {
+    mods = catalog.resolveMods(cat, data.scenario, data.addons ?? []);
+  } catch (e) {
+    return { error: e.message };
+  }
+  const layer  = deepMerge({ game: { name: data.name, scenarioId: data.scenario, mods } },
+                           data.overrides ?? {});
+  const merged = deepMerge(base, layer);
+  const error  = validateMerged(merged);
+  return error ? { error } : { merged };
+}
+
+async function loadServers(base, packs, cat) {
   if (!existsSync(SERVERS_DIR)) return [];
   const files = await readdir(SERVERS_DIR);
   const out = [];
@@ -232,6 +264,13 @@ async function loadServers(base, packs) {
     const path = join(SERVERS_DIR, file);
     try {
       const data = JSON.parse(await readFile(path, 'utf8'));
+
+      if (isPreset(data)) {
+        const { merged, error } = resolvePreset(base, data, cat);
+        out.push({ file, path, data, merged: merged ?? null, packCount: 0, preset: true, error });
+        continue;
+      }
+
       const merged = deepMerge(base, data);
 
       let error = validateMerged(merged);
@@ -434,6 +473,269 @@ async function tailLog(logFile) {
   });
 }
 
+// ── workshop ──────────────────────────────────────────────────────────────
+function catalogLine(id, entry) {
+  const scn  = entry.scenarios?.length ?? 0;
+  const dep  = entry.dependencies?.length ?? 0;
+  const meta = `${entry.version ?? '?'} · ${scn} scn · ${dep} dep`;
+  const flag = entry.obsolete ? '  ' + c.red('obsolete') : '';
+  return `${c.bold(entry.name)}  ${c.dim('· ' + meta)}${flag}  ${c.dim(id)}`;
+}
+
+async function workshopSearch() {
+  const query = (await input({ message: 'Search workshop (name):' })).trim();
+  if (!query) return;
+
+  let page = 1;
+  let pageSize = 0;
+  while (true) {
+    const spin = new Spinner().start(`Searching “${query}” — page ${page}…`);
+    let res;
+    try { res = await api.search(query, page); }
+    catch (e) { spin.fail(`Search failed: ${e.message}`); await sleep(900); return; }
+
+    if (page === 1) pageSize = res.rows.length || 1;
+    spin.succeed(`${res.count} result${res.count === 1 ? '' : 's'} for “${query}” — page ${page}`);
+
+    if (res.rows.length === 0) { console.log(c.dim('  no results')); await sleep(800); return; }
+
+    const choices = res.rows.map(r => ({
+      name: `${c.bold(r.name)}  ${c.dim('· ' + (r.currentVersionNumber ?? '?') +
+        ' · ' + (r.subscriberCount ?? 0) + ' subs')}  ${c.dim(r.id)}`,
+      value: { kind: 'mod', id: r.id, name: r.name },
+    }));
+    if (page > 1)                          choices.push({ name: c.dim('‹ previous page'), value: { kind: 'prev' } });
+    if (page * pageSize < res.count)        choices.push({ name: c.dim('next page ›'),    value: { kind: 'next' } });
+    choices.push({ name: c.dim('— back —'), value: { kind: 'back' } });
+
+    const pick = await select({ message: 'Subscribe to:', choices, pageSize: 20 });
+    if (pick.kind === 'back') return;
+    if (pick.kind === 'next') { page++; continue; }
+    if (pick.kind === 'prev') { page--; continue; }
+
+    const cat  = await catalog.load();
+    const spin2 = new Spinner().start(`Subscribing ${c.bold(pick.name)}…`);
+    try {
+      await catalog.subscribe(cat, pick.id, pick.name);
+      await catalog.save(cat);
+      const e = cat[pick.id];
+      spin2.succeed(`Subscribed ${c.bold(pick.name)} — ` +
+        `${e.scenarios.length} scenario(s), ${e.dependencies.length} dependency(ies)`);
+    } catch (e) {
+      spin2.fail(`Subscribe failed: ${e.message}`);
+    }
+    await sleep(900);
+    return;
+  }
+}
+
+async function workshopCatalog() {
+  let cat;
+  try { cat = await catalog.load(); }
+  catch (e) { console.log(c.red(`  ${e.message}`)); await sleep(1200); return; }
+
+  const ids    = Object.keys(cat).filter(id => catalog.isSubscribed(cat[id]));
+  const depIds = Object.keys(cat).length - ids.length;
+  if (ids.length === 0) {
+    console.log(c.dim('\n  catalog is empty — subscribe to mods first\n'));
+    await sleep(900);
+    return;
+  }
+
+  const choices = ids.map(id => ({ name: catalogLine(id, cat[id]), value: id }));
+  choices.push({ name: c.dim('— back —'), value: '__back__' });
+
+  const depNote = depIds ? c.dim(`  (+${depIds} dependency mods hidden)`) : '';
+  const pick = await select({
+    message: `Catalog — ${ids.length} mods:${depNote}`,
+    choices,
+    pageSize: 20,
+  });
+  if (pick === '__back__') return;
+
+  const entry = cat[pick];
+  console.log();
+  console.log(`  ${c.bold(entry.name)}  ${c.dim(pick)}`);
+  console.log(`  ${c.dim('version:')} ${entry.version ?? '—'}   ` +
+    `${c.dim('game:')} ${entry.gameVersion ?? '—'}   ${c.dim('size:')} ${formatSize(entry.size)}` +
+    (entry.obsolete ? `   ${c.red('obsolete')}` : ''));
+  if (entry.dependencies?.length) {
+    console.log(`  ${c.dim('deps:')}    ${entry.dependencies.map(d => d.name).join(', ')}`);
+  }
+  if (entry.scenarios?.length) {
+    console.log(`  ${c.dim('scenarios:')}`);
+    for (const s of entry.scenarios) {
+      console.log(`    ${s.name}  ${c.dim('· ' + s.gameMode + ' · ' + (s.playerCount ?? '?') + 'p')}`);
+    }
+  }
+  console.log();
+
+  const action = await select({
+    message: 'Action:',
+    choices: [
+      { name: 'Unsubscribe (remove from catalog)', value: 'remove' },
+      { name: c.dim('— back —'),                   value: 'back'   },
+    ],
+  });
+  if (action === 'remove' &&
+      await confirm({ message: `Remove ${entry.name}?`, default: false })) {
+    delete cat[pick];
+    catalog.pruneOrphans(cat);
+    await catalog.save(cat);
+    console.log(c.dim(`  removed ${entry.name}`));
+    await sleep(600);
+  }
+}
+
+async function workshopUpdates() {
+  let cat;
+  try { cat = await catalog.load(); }
+  catch (e) { console.log(c.red(`  ${e.message}`)); await sleep(1200); return; }
+
+  const ids = Object.keys(cat);
+  if (ids.length === 0) {
+    console.log(c.dim('\n  catalog is empty\n'));
+    await sleep(900);
+    return;
+  }
+
+  const spin = new Spinner().start(`Checking ${ids.length} mods for updates…`);
+  let changes;
+  try { changes = await catalog.checkUpdates(cat); }
+  catch (e) { spin.fail(`Update check failed: ${e.message}`); await sleep(900); return; }
+
+  const errors  = changes.filter(ch => ch.error);
+  const updates = changes.filter(ch => !ch.error);
+
+  if (updates.length === 0 && errors.length === 0) {
+    spin.succeed('All mods up to date');
+    await sleep(900);
+    return;
+  }
+  spin.succeed(`${updates.length} update(s) available` +
+    (errors.length ? `, ${errors.length} check error(s)` : ''));
+
+  console.log();
+  for (const u of updates) {
+    const flag = u.obsolete ? '  ' + c.red('OBSOLETE') : '';
+    console.log(`  ${c.yellow('↑')} ${c.bold(u.name)}  ${u.from ?? '?'} ${c.dim('→')} ${c.green(u.to ?? '?')}${flag}`);
+  }
+  for (const e of errors) {
+    console.log(`  ${c.red('✗')} ${c.bold(e.name)}  ${c.dim(e.error)}`);
+  }
+  console.log();
+
+  if (updates.length &&
+      await confirm({ message: `Apply ${updates.length} update(s) to catalog?`, default: true })) {
+    for (const u of updates) cat[u.modId] = u.entry;
+    await catalog.save(cat);
+    console.log(c.dim('  catalog updated'));
+    await sleep(600);
+  }
+}
+
+async function workshopMenu() {
+  while (true) {
+    let count = 0;
+    try {
+      const cat = await catalog.load();
+      count = Object.keys(cat).filter(id => catalog.isSubscribed(cat[id])).length;
+    } catch {}
+    console.log();
+    const choice = await select({
+      message: `Workshop  ${c.dim('· ' + count + ' mods in catalog')}`,
+      choices: [
+        { name: 'Search & subscribe', value: 'search'  },
+        { name: 'View catalog',       value: 'catalog' },
+        { name: 'Check for updates',  value: 'updates' },
+        { name: c.dim('— back —'),    value: 'back'    },
+      ],
+    });
+    if (choice === 'back')    return;
+    if (choice === 'search')  await workshopSearch();
+    if (choice === 'catalog') await workshopCatalog();
+    if (choice === 'updates') await workshopUpdates();
+  }
+}
+
+// ── compose & start ───────────────────────────────────────────────────────
+// Build a server config on the fly from the workshop catalog: pick a scenario,
+// toggle addon mods, resolve the dependency tree, then compile + start.
+async function composeAndStart(base) {
+  let cat;
+  try { cat = await catalog.load(); }
+  catch (e) { console.log(c.red(`  ${e.message}`)); await sleep(1200); return; }
+
+  // only scenarios from explicitly-subscribed mods — dependency mods are noise
+  const scenarios = catalog.allScenarios(cat)
+    .filter(s => catalog.isSubscribed(cat[s.modId]));
+  if (scenarios.length === 0) {
+    console.log(c.dim('\n  no scenarios available — subscribe to mods in the Workshop menu first\n'));
+    await sleep(1300);
+    return;
+  }
+
+  const scChoices = scenarios.map(s => ({
+    name: `${c.bold(s.name)}  ${c.dim('· ' + s.gameMode + ' · ' +
+      (s.playerCount ?? '?') + 'p · ' + s.modName)}`,
+    value: s,
+  }));
+  scChoices.push({ name: c.dim('— back —'), value: null });
+
+  const scenario = await select({ message: 'Pick a scenario:', choices: scChoices, pageSize: 20 });
+  if (!scenario) return;
+
+  // mods pulled in automatically by the scenario (provider + dependency tree)
+  const auto = new Set(catalog.resolveMods(cat, scenario.scenarioId).map(m => m.modId));
+
+  const addonChoices = Object.keys(cat)
+    .filter(id => !auto.has(id) && catalog.isSubscribed(cat[id]))
+    .map(id => ({ name: catalogLine(id, cat[id]), value: id }));
+
+  let addonIds = [];
+  if (addonChoices.length) {
+    addonIds = await checkbox({
+      message: 'Add addon mods (space to toggle, enter to confirm):',
+      choices: addonChoices,
+      pageSize: 20,
+    });
+  }
+
+  const mods = catalog.resolveMods(cat, scenario.scenarioId, addonIds);
+
+  const defaultName = base?.game?.name || scenario.name;
+  const name = (await input({ message: 'Server name:', default: defaultName })).trim() || defaultName;
+
+  const merged = deepMerge(base, { game: { name, scenarioId: scenario.scenarioId, mods } });
+  const error  = validateMerged(merged);
+  if (error) {
+    console.log(c.red(`  cannot start: ${error}`));
+    await sleep(1500);
+    return;
+  }
+
+  console.log();
+  console.log(`  ${c.dim('scenario:')} ${scenario.name}  ${c.dim('(' + scenario.gameMode + ')')}`);
+  console.log(`  ${c.dim('mods:')}     ${mods.length}  ${c.dim('(incl. dependencies · ' +
+    addonIds.length + ' addon' + (addonIds.length === 1 ? '' : 's') + ')')}`);
+  console.log();
+
+  const file = `${slugify(name)}.json`;
+
+  if (await confirm({ message: 'Save as a reusable preset in servers/?', default: false })) {
+    const presetPath = join(SERVERS_DIR, file);
+    const preset = { name, scenario: scenario.scenarioId, addons: addonIds };
+    await writeFile(presetPath, JSON.stringify(preset, null, 2));
+    console.log(c.dim(`  saved ${presetPath}`));
+  }
+
+  if (!await confirm({ message: `Start “${name}”?`, default: true })) return;
+
+  console.log();
+  await startServer({ file, merged });
+  await sleep(700);
+}
+
 async function idleMenu(base, servers) {
   // base summary line for context
   const bport = base.bindPort ?? '?';
@@ -445,20 +747,30 @@ async function idleMenu(base, servers) {
   console.log(`${c.dim('○')}  ${c.dim('no server running')}`);
   console.log();
 
-  const choices = servers.map(cfg => ({
+  const choices = [{
+    name:  `${c.cyan('▸  Compose & start')}  ${c.dim('(pick a scenario from the catalog)')}`,
+    value: '__compose__',
+  }];
+  choices.push(...servers.map(cfg => ({
     name:  summarize(cfg),
     value: cfg,
     disabled: cfg.error ? c.red(' ' + cfg.error) : false,
-  }));
+  })));
+  choices.push({
+    name:  `${c.cyan('⚙  Workshop')}  ${c.dim('(search · catalog · updates)')}`,
+    value: '__workshop__',
+  });
   choices.push({ name: c.dim('— quit —'), value: '__quit__' });
 
   const pick = await select({
-    message: 'Pick a server to start:',
+    message: 'What would you like to do?',
     choices,
     pageSize: 20,
   });
 
-  if (pick === '__quit__') return 'exit';
+  if (pick === '__quit__')     return 'exit';
+  if (pick === '__workshop__') { await workshopMenu(); return; }
+  if (pick === '__compose__')  { await composeAndStart(base); return; }
 
   console.log();
   await startServer(pick);
@@ -480,15 +792,13 @@ async function main() {
 
     const packs   = await loadModpacks();
     const state   = await readState();
-    const servers = await loadServers(base, packs);
+    let cat = {};
+    try { cat = await catalog.load(); }
+    catch (e) { console.log(c.red(`workshop catalog: ${e.message}`)); }
+    const servers = await loadServers(base, packs, cat);
 
     if (state && state.pid !== prevPid) firstRunningView = true;
     prevPid = state?.pid ?? null;
-
-    if (!state && servers.length === 0) {
-      console.log(c.red(`No *.json files in ${SERVERS_DIR}`));
-      return;
-    }
 
     const result = state
       ? await runningMenu(state, firstRunningView)
