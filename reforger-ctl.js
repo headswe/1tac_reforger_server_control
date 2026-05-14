@@ -8,7 +8,7 @@
 //   logs/              — per-run server logs
 //   state/server.json  — running server tracking
 
-import { select, confirm, input } from '@inquirer/prompts';
+import { select, confirm, input, checkbox } from '@inquirer/prompts';
 import { readdir, readFile, writeFile, unlink, mkdir } from 'node:fs/promises';
 import { existsSync, openSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -161,6 +161,9 @@ function formatSize(bytes) {
   if (bytes == null) return '—';
   const mb = bytes / 1048576;
   return mb < 1024 ? `${mb.toFixed(0)} MB` : `${(mb / 1024).toFixed(1)} GB`;
+}
+function slugify(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'composed';
 }
 
 // ── load base + modpacks + servers ────────────────────────────────────────
@@ -616,6 +619,72 @@ async function workshopMenu() {
   }
 }
 
+// ── compose & start ───────────────────────────────────────────────────────
+// Build a server config on the fly from the workshop catalog: pick a scenario,
+// toggle addon mods, resolve the dependency tree, then compile + start.
+async function composeAndStart(base) {
+  let cat;
+  try { cat = await catalog.load(); }
+  catch (e) { console.log(c.red(`  ${e.message}`)); await sleep(1200); return; }
+
+  const scenarios = catalog.allScenarios(cat);
+  if (scenarios.length === 0) {
+    console.log(c.dim('\n  no scenarios available — subscribe to mods in the Workshop menu first\n'));
+    await sleep(1300);
+    return;
+  }
+
+  const scChoices = scenarios.map(s => ({
+    name: `${c.bold(s.name)}  ${c.dim('· ' + s.gameMode + ' · ' +
+      (s.playerCount ?? '?') + 'p · ' + s.modName)}`,
+    value: s,
+  }));
+  scChoices.push({ name: c.dim('— back —'), value: null });
+
+  const scenario = await select({ message: 'Pick a scenario:', choices: scChoices, pageSize: 20 });
+  if (!scenario) return;
+
+  // mods pulled in automatically by the scenario (provider + dependency tree)
+  const auto = new Set(catalog.resolveMods(cat, scenario.scenarioId).map(m => m.modId));
+
+  const addonChoices = Object.keys(cat)
+    .filter(id => !auto.has(id))
+    .map(id => ({ name: catalogLine(id, cat[id]), value: id }));
+
+  let addonIds = [];
+  if (addonChoices.length) {
+    addonIds = await checkbox({
+      message: 'Add addon mods (space to toggle, enter to confirm):',
+      choices: addonChoices,
+      pageSize: 20,
+    });
+  }
+
+  const mods = catalog.resolveMods(cat, scenario.scenarioId, addonIds);
+
+  const defaultName = base?.game?.name || scenario.name;
+  const name = (await input({ message: 'Server name:', default: defaultName })).trim() || defaultName;
+
+  const merged = deepMerge(base, { game: { name, scenarioId: scenario.scenarioId, mods } });
+  const error  = validateMerged(merged);
+  if (error) {
+    console.log(c.red(`  cannot start: ${error}`));
+    await sleep(1500);
+    return;
+  }
+
+  console.log();
+  console.log(`  ${c.dim('scenario:')} ${scenario.name}  ${c.dim('(' + scenario.gameMode + ')')}`);
+  console.log(`  ${c.dim('mods:')}     ${mods.length}  ${c.dim('(incl. dependencies · ' +
+    addonIds.length + ' addon' + (addonIds.length === 1 ? '' : 's') + ')')}`);
+  console.log();
+  if (!await confirm({ message: `Start “${name}”?`, default: true })) return;
+
+  console.log();
+  await startServer({ file: `${slugify(name)}.json`, merged });
+  await sleep(700);
+}
+
 async function idleMenu(base, servers) {
   // base summary line for context
   const bport = base.bindPort ?? '?';
@@ -627,11 +696,15 @@ async function idleMenu(base, servers) {
   console.log(`${c.dim('○')}  ${c.dim('no server running')}`);
   console.log();
 
-  const choices = servers.map(cfg => ({
+  const choices = [{
+    name:  `${c.cyan('▸  Compose & start')}  ${c.dim('(pick a scenario from the catalog)')}`,
+    value: '__compose__',
+  }];
+  choices.push(...servers.map(cfg => ({
     name:  summarize(cfg),
     value: cfg,
     disabled: cfg.error ? c.red(' ' + cfg.error) : false,
-  }));
+  })));
   choices.push({
     name:  `${c.cyan('⚙  Workshop')}  ${c.dim('(search · catalog · updates)')}`,
     value: '__workshop__',
@@ -639,13 +712,14 @@ async function idleMenu(base, servers) {
   choices.push({ name: c.dim('— quit —'), value: '__quit__' });
 
   const pick = await select({
-    message: 'Pick a server to start:',
+    message: 'What would you like to do?',
     choices,
     pageSize: 20,
   });
 
   if (pick === '__quit__')     return 'exit';
   if (pick === '__workshop__') { await workshopMenu(); return; }
+  if (pick === '__compose__')  { await composeAndStart(base); return; }
 
   console.log();
   await startServer(pick);
@@ -671,11 +745,6 @@ async function main() {
 
     if (state && state.pid !== prevPid) firstRunningView = true;
     prevPid = state?.pid ?? null;
-
-    if (!state && servers.length === 0) {
-      console.log(c.red(`No *.json files in ${SERVERS_DIR}`));
-      return;
-    }
 
     const result = state
       ? await runningMenu(state, firstRunningView)
